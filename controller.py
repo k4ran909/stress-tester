@@ -25,8 +25,10 @@ import sys
 import argparse
 import os
 
-workers = {}   # {name: socket}
+workers = {}        # {name: socket}
+worker_info = {}    # {name: {ip, connected_at, last_seen, status}}
 lock = threading.Lock()
+worker_count_changed = threading.Event()
 
 # ══════════════════════════════════════════════════════════════════
 #  Method definitions — synced with start.py & worker.py
@@ -65,7 +67,16 @@ def handle_worker(conn, addr):
     name = f"{addr[0]}:{addr[1]}"
     with lock:
         workers[name] = conn
-    sys.stdout.write(f"\n  {C.GREEN}✅ Worker connected: {name} (total: {len(workers)}){C.RESET}\n")
+        worker_info[name] = {
+            "ip": addr[0],
+            "port": addr[1],
+            "connected_at": time.time(),
+            "last_seen": time.time(),
+            "status": "idle",
+        }
+    worker_count_changed.set()
+    n = len(workers)
+    sys.stdout.write(f"\n  {C.GREEN}✅ Worker connected: {name} [{n} online]{C.RESET}\n")
     print_prompt()
 
     try:
@@ -77,6 +88,10 @@ def handle_worker(conn, addr):
                 msg = json.loads(data.decode())
                 if msg.get("type") == "stats":
                     method = msg.get("method", "?")
+                    with lock:
+                        if name in worker_info:
+                            worker_info[name]["last_seen"] = time.time()
+                            worker_info[name]["status"] = f"attacking ({method})"
                     sys.stdout.write(
                         f"\r  {C.CYAN}📊 [{name}] {method} | {msg.get('sent', 0):,} pkts | "
                         f"{msg.get('pps', 0):,.0f} pps | "
@@ -84,6 +99,10 @@ def handle_worker(conn, addr):
                     )
                     print_prompt()
                 elif msg.get("type") == "done":
+                    with lock:
+                        if name in worker_info:
+                            worker_info[name]["status"] = "idle"
+                            worker_info[name]["last_seen"] = time.time()
                     sys.stdout.write(
                         f"\r  {C.GREEN}✅ [{name}] Attack finished. "
                         f"Total: {msg.get('total', 0):,} pkts in {msg.get('duration', 0):.1f}s{C.RESET}\n"
@@ -101,7 +120,10 @@ def handle_worker(conn, addr):
     finally:
         with lock:
             workers.pop(name, None)
-        sys.stdout.write(f"\n  {C.RED}❌ Worker disconnected: {name} (total: {len(workers)}){C.RESET}\n")
+            worker_info.pop(name, None)
+        worker_count_changed.set()
+        n = len(workers)
+        sys.stdout.write(f"\n  {C.RED}❌ Worker disconnected: {name} [{n} online]{C.RESET}\n")
         print_prompt()
         conn.close()
 
@@ -121,8 +143,21 @@ def broadcast(msg):
     return len(workers)
 
 
+def format_uptime(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+
 def print_prompt():
-    sys.stdout.write(f"{C.YELLOW}aegis-stress> {C.RESET}")
+    n = len(workers)
+    color = C.GREEN if n > 0 else C.RED
+    sys.stdout.write(f"{color}[{n} workers]{C.RESET} {C.YELLOW}aegis-stress> {C.RESET}")
     sys.stdout.flush()
 
 
@@ -220,10 +255,21 @@ def main():
         elif cmd == "STATUS":
             with lock:
                 n = len(workers)
-            print(f"  {C.CYAN}Connected workers: {n}{C.RESET}")
-            with lock:
-                for name in workers:
-                    print(f"    {C.GREEN}• {name}{C.RESET}")
+                infos = dict(worker_info)
+            print(f"\n  {C.BOLD}{'═' * 60}{C.RESET}")
+            print(f"  {C.BOLD}  CONNECTED WORKERS: {C.GREEN}{n}{C.RESET}")
+            print(f"  {C.BOLD}{'═' * 60}{C.RESET}")
+            if n == 0:
+                print(f"  {C.RED}  No workers connected{C.RESET}")
+            else:
+                print(f"  {C.CYAN}  {'#':<4} {'Worker IP':<22} {'Uptime':<12} {'Status':<20}{C.RESET}")
+                print(f"  {C.CYAN}  {'─' * 56}{C.RESET}")
+                for i, (wname, winfo) in enumerate(infos.items(), 1):
+                    uptime = format_uptime(time.time() - winfo['connected_at'])
+                    status = winfo.get('status', 'idle')
+                    status_color = C.GREEN if status == 'idle' else C.YELLOW
+                    print(f"  {C.GREEN}  {i:<4} {wname:<22} {uptime:<12} {status_color}{status}{C.RESET}")
+            print(f"  {C.BOLD}{'═' * 60}{C.RESET}\n")
 
         elif cmd == "METHODS":
             print_methods()
