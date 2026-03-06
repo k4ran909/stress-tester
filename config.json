@@ -1,3 +1,25 @@
 {
-    "MCBOT": "Bot_"
+    "version": "4.0",
+    "tool": "AegisShield Stress Tester",
+    "defaults": {
+        "l4_threads": 100,
+        "l7_threads": 200,
+        "duration": 60,
+        "power": 100
+    },
+    "mcbot": {
+        "protocol_version": 47,
+        "usernames": [
+            "Bot_",
+            "Player_",
+            "Test_",
+            "User_"
+        ],
+        "chat_length": 128,
+        "join_delay": 1.0
+    },
+    "controller": {
+        "port": 7777,
+        "host": "0.0.0.0"
+    }
 }

