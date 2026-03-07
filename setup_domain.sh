@@ -110,26 +110,10 @@ systemctl restart nginx
 
 # ── 4. SSL with Let's Encrypt ─────────────────────────────────
 echo "  [4/4] Getting SSL certificate..."
-echo ""
-echo "  ⚠  IMPORTANT: Before running certbot, make sure you've"
-echo "     added this DNS record:"
-echo ""
-echo "     Type: A"
-echo "     Name: security"
-echo "     Value: $(curl -s ifconfig.me 2>/dev/null || echo '159.65.32.13')"
-echo "     TTL: Auto"
-echo ""
-
-read -p "  Have you added the DNS record? (y/n): " dns_ready
-if [ "$dns_ready" = "y" ] || [ "$dns_ready" = "Y" ]; then
-    certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@o3dn.online --redirect || {
-        echo "  [!] Certbot failed — DNS may not have propagated yet."
-        echo "      Run later: certbot --nginx -d $DOMAIN"
-    }
-else
-    echo "  Skipping SSL. Add DNS record first, then run:"
-    echo "    certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@o3dn.online --redirect"
-fi
+certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@o3dn.online --redirect 2>/dev/null || {
+    echo "  [!] SSL setup skipped (cert may already exist or DNS not ready)"
+    echo "      Run manually: certbot --nginx -d $DOMAIN"
+}
 
 # ── Done ──────────────────────────────────────────────────────
 echo ""
